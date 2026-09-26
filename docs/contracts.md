@@ -906,3 +906,74 @@ Outcome::Draw → status = Cancelled → claim_refund() (full bet.amount, no fee
 | `BALANCE` | `i128` | Current XLM balance in stroops |
 | `TOTAL_FEES_EARNED` | `i128` | Lifetime cumulative fees |
 | `WITHDRAWAL_LOG` | `Vec<(Address, i128, u64)>` | Past withdrawals |
+
+---
+
+## Protocol Fee — Single Source of Truth (C-67)
+
+**Decision**: `Market.protocol_fee_bp` is the authoritative fee rate for a given market.
+
+### Rationale
+
+The fee rate was previously duplicated across three locations:
+
+| Location | Field | Problem |
+|---|---|---|
+| `Market` | `protocol_fee_bp` | Snapshotted at creation, used for payouts |
+| `Treasury` | `fee_bps` | Runtime-tunable, not read by Market |
+| `MarketFactory` `ProtocolConfig` | `default_fee_bp` | Used only at market creation |
+
+This led to the displayed fee (from Treasury/Factory) diverging from the charged fee (from Market).
+
+### Resolution
+
+- `Market.protocol_fee_bp` is **snapshotted from `ProtocolConfig.default_fee_bp`** at market creation time via the `initialize` call from the factory. It never changes for the lifetime of that market.
+- `Treasury.fee_bps` is tunable via `set_fee_bps` (C-66) and controls the *default* rate used for **newly created markets**. It does not retroactively alter already-deployed markets.
+- `MarketFactory.ProtocolConfig.default_fee_bp` feeds into every new `Market.initialize` call.
+
+### Flow
+
+```
+set_fee_bps(new_bps) → Treasury.fee_bps
+                              ↓
+          Factory reads Treasury.fee_bps when building ProtocolConfig
+                              ↓
+          create_market() snapshots ProtocolConfig.default_fee_bp
+                              ↓
+          Market.initialize(protocol_fee_bp = default_fee_bp)  ← immutable per market
+                              ↓
+          claim_winnings uses Market.protocol_fee_bp for payout math
+                              ↓
+          finalize_resolution calls Treasury.deposit_fees(fee_amount)  ← C-68
+```
+
+### Deprecated / Removed Fields
+
+- `Market.fee_collector_address` — fee routing now goes through `Treasury` directly; the address is stored once in `Treasury.fee_recipient` and configurable via `set_fee_recipient` (C-65).
+
+---
+
+## Treasury Admin Rotation (C-65)
+
+Treasury admin transfers use a **two-step propose/accept pattern** to prevent mistyped addresses locking the contract permanently.
+
+```
+current_admin  → propose_admin(new_admin)   # stores PENDING_ADMIN
+new_admin      → accept_admin()             # swaps ADMIN, clears PENDING_ADMIN
+```
+
+Until `accept_admin` is called, the current admin retains all privileges and may overwrite the proposal by calling `propose_admin` again.
+
+### Fee Recipient Updates
+
+`set_fee_recipient(admin, new_recipient)` updates the address that receives fee withdrawals and emits a `fee_recipient_updated` event. Only the stored admin may call it.
+
+---
+
+## Treasury Fee Crediting (C-68)
+
+On `finalize_resolution`, the Market contract calls `Treasury.deposit_fees(market_id, fee_amount)` **exactly once**. A `FeeDeposited` boolean flag in Market storage prevents double-crediting if `finalize_resolution` is called again (e.g. after a dispute is resolved).
+
+The fee amount equals `calculate_fee(market.total_pool, market.protocol_fee_bp)`.
+
+Cancelled markets (Draw / NoContest / admin cancel) do **not** call `deposit_fees`; they refund the full pool to bettors with no fee deducted.
